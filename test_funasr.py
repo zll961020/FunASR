@@ -1,3 +1,12 @@
+
+import logging
+# 在导入 FunASR 之前设置日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True  # 强制重新配置，覆盖后续的配置
+)
+from funasr.models.seaco_paraformer.model import SeacoParaformer
 from funasr import AutoModel 
 import json 
 import re, string
@@ -12,8 +21,14 @@ def strip_punctuation(text: str) -> str:
     punctuation = string.punctuation + "，。！？；：【】（）《》‘’“”…—、"
     return re.sub(f"[{re.escape(punctuation)}]", "", text)
 
-def transcribe(model, audio_path, batch_size,hotword_list_txt=None):
-    text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt)[0]['text']
+def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_graph_score=10.0, decoding_ctc_weight=0.4, beam_size=5, mode='greedy_search'):
+    if mode == 'greedy_search':
+        text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt)[0]['text']
+    elif mode == 'beam_search':
+        logging.info(f"decoding_ctc_weight: {decoding_ctc_weight}, beam_size: {beam_size}") 
+        text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt, decoding_ctc_weight=decoding_ctc_weight,
+                              beam_size=beam_size, context_list_path=hotword_list_txt,
+                                context_graph_score=context_graph_score)[0]['text']
     return text 
 
 # ---------- 主逻辑 ----------
@@ -23,7 +38,8 @@ def main(args):
     # ------------ 构建模型（一次） ------------
     model = AutoModel(model=args.model,
                       device="cuda:0",
-                      disable_update=True)   # 关掉网络版本检查
+                      disable_update=True,
+                      disable_log=True)   # 关掉网络版本检查
     # ------------ 恢复机制 ------------
     processed_keys = set()
     if Path(args.output).is_file():
@@ -65,7 +81,7 @@ def main(args):
                     raise FileNotFoundError(wav_path)
 
                 text = strip_punctuation(
-                    transcribe(model, wav_path, args.batch_size, args.hotwords)
+                    transcribe(model, wav_path, args.batch_size, args.hotwords, args.context_graph_score, args.decoding_ctc_weight, args.beam_size, args.mode)
                 )
                 fout.write(f"{key} {text}\n")
                 ok += 1
@@ -87,7 +103,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, help="输出 txt")
     parser.add_argument("--model", type=str, help="模型路径")
     parser.add_argument("--hotwords", type=str, default=None, help="热词列表 txt")
+    parser.add_argument("--context_graph_score", type=float, default=10.0, help="上下文图得分")
+    parser.add_argument("--decoding_ctc_weight", type=float, default=0.4, help="CTC 权重")
     parser.add_argument("--batch_size", type=int, default=1, help="批量大小")
+    parser.add_argument("--mode", type=str, default='greedy_search', help="搜索模式")
+    parser.add_argument("--beam_size", type=int, default=5, help="beam 大小")
     parser.add_argument("--verbose", action="store_true", help="打印逐条结果")
     args = parser.parse_args()
     main(args)
