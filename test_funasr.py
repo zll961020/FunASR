@@ -7,6 +7,7 @@ logging.basicConfig(
     force=True  # 强制重新配置，覆盖后续的配置
 )
 from funasr.models.seaco_paraformer.model import SeacoParaformer
+from funasr.models.sense_voice.model import SenseVoiceSmall
 from funasr import AutoModel 
 import json 
 import re, string
@@ -15,6 +16,133 @@ from pathlib import Path
 import argparse
 import os 
 import torch  
+emo_dict = {
+	"<|HAPPY|>": "😊",
+	"<|SAD|>": "😔",
+	"<|ANGRY|>": "😡",
+	"<|NEUTRAL|>": "",
+	"<|FEARFUL|>": "😰",
+	"<|DISGUSTED|>": "🤢",
+	"<|SURPRISED|>": "😮",
+}
+
+event_dict = {
+	"<|BGM|>": "🎼",
+	"<|Speech|>": "",
+	"<|Applause|>": "👏",
+	"<|Laughter|>": "😀",
+	"<|Cry|>": "😭",
+	"<|Sneeze|>": "🤧",
+	"<|Breath|>": "",
+	"<|Cough|>": "🤧",
+}
+
+emoji_dict = {
+	"<|nospeech|><|Event_UNK|>": "❓",
+	"<|zh|>": "",
+	"<|en|>": "",
+	"<|yue|>": "",
+	"<|ja|>": "",
+	"<|ko|>": "",
+	"<|nospeech|>": "",
+	"<|HAPPY|>": "😊",
+	"<|SAD|>": "😔",
+	"<|ANGRY|>": "😡",
+	"<|NEUTRAL|>": "",
+	"<|BGM|>": "🎼",
+	"<|Speech|>": "",
+	"<|Applause|>": "👏",
+	"<|Laughter|>": "😀",
+	"<|FEARFUL|>": "😰",
+	"<|DISGUSTED|>": "🤢",
+	"<|SURPRISED|>": "😮",
+	"<|Cry|>": "😭",
+	"<|EMO_UNKNOWN|>": "",
+	"<|Sneeze|>": "🤧",
+	"<|Breath|>": "",
+	"<|Cough|>": "😷",
+	"<|Sing|>": "",
+	"<|Speech_Noise|>": "",
+	"<|withitn|>": "",
+	"<|woitn|>": "",
+	"<|GBG|>": "",
+	"<|Event_UNK|>": "",
+}
+
+lang_dict =  {
+    "<|zh|>": "<|lang|>",
+    "<|en|>": "<|lang|>",
+    "<|yue|>": "<|lang|>",
+    "<|ja|>": "<|lang|>",
+    "<|ko|>": "<|lang|>",
+    "<|nospeech|>": "<|lang|>",
+}
+
+emo_set = {"😊", "😔", "😡", "😰", "🤢", "😮"}
+event_set = {"🎼", "👏", "😀", "😭", "🤧", "😷",}
+
+def format_str(s):
+	for sptk in emoji_dict:
+		s = s.replace(sptk, emoji_dict[sptk])
+	return s
+
+
+def format_str_v2(s):
+	sptk_dict = {}
+	for sptk in emoji_dict:
+		sptk_dict[sptk] = s.count(sptk)
+		s = s.replace(sptk, "")
+	emo = "<|NEUTRAL|>"
+	for e in emo_dict:
+		if sptk_dict[e] > sptk_dict[emo]:
+			emo = e
+	for e in event_dict:
+		if sptk_dict[e] > 0:
+			s = event_dict[e] + s
+	s = s + emo_dict[emo]
+
+	for emoji in emo_set.union(event_set):
+		s = s.replace(" " + emoji, emoji)
+		s = s.replace(emoji + " ", emoji)
+	return s.strip()
+
+def format_str_v3(s):
+	def get_emo(s):
+		return s[-1] if s[-1] in emo_set else None
+	def get_event(s):
+		return s[0] if s[0] in event_set else None
+
+	s = s.replace("<|nospeech|><|Event_UNK|>", "❓")
+	for lang in lang_dict:
+		s = s.replace(lang, "<|lang|>")
+	s_list = [format_str_v2(s_i).strip(" ") for s_i in s.split("<|lang|>")]
+	# s_list[0] 可能为空，为了后续 ^ 匹配方便加一个空格前缀
+	new_s = " " + s_list[0]
+	cur_ent_event = get_event(new_s)
+	for i in range(1, len(s_list)):
+		if len(s_list[i]) == 0:
+			continue
+		if get_event(s_list[i]) == cur_ent_event and get_event(s_list[i]) != None:
+			s_list[i] = s_list[i][1:]
+		#else:
+		cur_ent_event = get_event(s_list[i])
+		if get_emo(s_list[i]) != None and get_emo(s_list[i]) == get_emo(new_s):
+			new_s = new_s[:-1]
+		new_s += s_list[i].strip().lstrip()
+
+	# ---------- 去掉可能残留的控制符前缀 ----------
+	# 允许前面带空格；只匹配一次
+	ctrl_prefix_pat = re.compile(
+		r'^\s*'                                 # 开头可有空白
+		r'(?:zh|en|yue|ja|ko|nospeech)?'        # 语言
+		r'(?:HAPPY|SAD|ANGRY|NEUTRAL|FEARFUL|DISGUSTED|SURPRISED)?'  # 情感
+		r'(?:Speech)?'                          # Speech
+		r'(?:woitn|withitn)?'                   # ITN 标记
+	)
+	new_s = re.sub(ctrl_prefix_pat, '', new_s, count=1).lstrip()
+	# -----------------------------------------------------
+	new_s = new_s.replace("The.", " ")
+	return new_s.strip()
 
 def strip_punctuation(text: str) -> str:
     # 英文 + 常见中日韩符号，如需更多自行补充
@@ -23,12 +151,14 @@ def strip_punctuation(text: str) -> str:
 
 def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_graph_score=10.0, decoding_ctc_weight=0.4, beam_size=5, mode='greedy_search'):
     if mode == 'greedy_search':
+        logging.info('init greedy_search')
         text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt)[0]['text']
     elif mode == 'beam_search':
         logging.info(f"decoding_ctc_weight: {decoding_ctc_weight}, beam_size: {beam_size}") 
         text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt, decoding_ctc_weight=decoding_ctc_weight,
                               beam_size=beam_size, context_list_path=hotword_list_txt,
                                 context_graph_score=context_graph_score)[0]['text']
+    
     return text 
 
 # ---------- 主逻辑 ----------
@@ -80,9 +210,18 @@ def main(args):
                 if not Path(wav_path).is_file():
                     raise FileNotFoundError(wav_path)
 
-                text = strip_punctuation(
-                    transcribe(model, wav_path, args.batch_size, args.hotwords, args.context_graph_score, args.decoding_ctc_weight, args.beam_size, args.mode)
+                # 1. 先得到原始转写
+                text_raw = transcribe(
+                    model, wav_path, args.batch_size,
+                    args.hotwords, args.context_graph_score,
+                    args.decoding_ctc_weight, args.beam_size, args.mode,
                 )
+                # 2. 如果是 SenseVoiceSmall，先做特殊标记清理
+                if isinstance(model.model, SenseVoiceSmall):
+                    text_raw = format_str_v3(text_raw)
+                # 3. 最后再去掉标点
+                text = strip_punctuation(text_raw)
+
                 fout.write(f"{key} {text}\n")
                 ok += 1
                 if args.verbose:
