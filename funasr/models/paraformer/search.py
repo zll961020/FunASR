@@ -108,6 +108,7 @@ class BeamSearchPara(torch.nn.Module):
             and self.pre_beam_size < self.n_vocab
             and len(self.part_scorers) > 0
         )
+        logging.info(f'do_pre_beam: {self.do_pre_beam} pre_beam_score_key: {self.pre_beam_score_key} pre_beam_size: {self.pre_beam_size} n_vocab: {self.n_vocab}')
 
     def init_hyp(self, x: torch.Tensor) -> List[Hypothesis]:
         """Get an initial hypothesis data.
@@ -434,17 +435,31 @@ class BeamSearchPara(torch.nn.Module):
             running_hyps = [
                 h._replace(yseq=self.append_token(h.yseq, self.eos)) for h in running_hyps
             ]
+           
 
         # add ended hypotheses to a final list, and removed them from current hypotheses
         # (this will be a problem, number of hyps < beam)
         remained_hyps = []
         for hyp in running_hyps:
-            if hyp.yseq[-1] == self.eos:
+            if hyp.yseq[-1] == self.eos: # check if the hypothesis ended 
                 # e.g., Word LM needs to add final <eos> score
+                # if context_graph is used, finalize the context graph state
+                new_scores = hyp.scores.copy()
+                new_states = hyp.states.copy()
                 for k, d in chain(self.full_scorers.items(), self.part_scorers.items()):
-                    s = d.final_score(hyp.states[k])
-                    hyp.scores[k] += s
-                    hyp = hyp._replace(score=hyp.score + self.weights[k] * s)
+                    if k == "ctc" and hasattr(d, "context_graph") and d.context_graph is not None:
+                        ctx_state = hyp.states[k][2]  # get context_graph state
+                        bonus, final_state = d.context_graph.finalize(ctx_state)
+                        # update scores and states 
+                        s = d.final_score(hyp.states[k])
+                        new_scores[k] = hyp.scores[k] + s * self.weights[k] + bonus
+                        new_states[k] = (hyp.states[k][0], hyp.states[k][1], final_state)
+                        hyp = hyp._replace(score=hyp.score + self.weights[k] * s + bonus,
+                                          scores=new_scores, states=new_states)
+                    else:
+                        s = d.final_score(hyp.states[k])
+                        hyp.scores[k] += s
+                        hyp = hyp._replace(score=hyp.score + self.weights[k] * s)
                 ended_hyps.append(hyp)
             else:
                 remained_hyps.append(hyp)

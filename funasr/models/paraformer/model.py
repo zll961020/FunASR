@@ -2,14 +2,18 @@
 # -*- encoding: utf-8 -*-
 # Copyright FunASR (https://github.com/alibaba-damo-academy/FunASR). All Rights Reserved.
 #  MIT License  (https://opensource.org/licenses/MIT)
-
+import os
+import re
 import time
 import copy
 import torch
 import logging
+import tempfile
+import requests
+import codecs
 from torch.cuda.amp import autocast
 from typing import Union, Dict, List, Tuple, Optional
-
+from functools import lru_cache
 from funasr.register import tables
 from funasr.models.ctc.ctc import CTC
 from funasr.utils import postprocess_utils
@@ -24,7 +28,7 @@ from funasr.models.transformer.utils.add_sos_eos import add_sos_eos
 from funasr.models.transformer.utils.nets_utils import make_pad_mask
 from funasr.utils.timestamp_tools import ts_prediction_lfr6_standard
 from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
-
+from funasr.utils.context_graph import ContextGraph 
 
 @tables.register("model_classes", "Paraformer")
 class Paraformer(torch.nn.Module):
@@ -405,13 +409,19 @@ class Paraformer(torch.nn.Module):
         scorers = {}
 
         if self.ctc != None:
-            ctc = CTCPrefixScorer(ctc=self.ctc, eos=self.eos)
+            logging.info(f'init ctcprefixscorer, context_graph: {self.context_graph}')
+            ctc = CTCPrefixScorer(ctc=self.ctc, eos=self.eos, context_graph=self.context_graph)
             scorers.update(ctc=ctc)
         token_list = kwargs.get("token_list")
         scorers.update(
             length_bonus=LengthBonus(len(token_list)),
         )
-
+        if self.context_graph is not None and self.ctc is None:
+            logging.info(f'init contextscorer')
+            from funasr.models.transformer.scorers.context_scorer import ContextScorer
+            scorers.update(
+                ctx=ContextScorer(self.context_graph)
+            )
         # 3. Build ngram model
         # ngram is not supported now
         ngram = None
@@ -423,6 +433,7 @@ class Paraformer(torch.nn.Module):
             lm=kwargs.get("lm_weight", 0.0),
             ngram=kwargs.get("ngram_weight", 0.0),
             length_bonus=kwargs.get("penalty", 0.0),
+            ctx=1.0, # fix ctx weight, just adjust context_graph_score
         )
         beam_search = BeamSearchPara(
             beam_size=kwargs.get("beam_size", 2),
@@ -454,8 +465,26 @@ class Paraformer(torch.nn.Module):
         is_use_lm = (
             kwargs.get("lm_weight", 0.0) > 0.00001 and kwargs.get("lm_file", None) is not None
         )
+        logging.info(f'is_use_ctc: {is_use_ctc}, is_use_lm: {is_use_lm} beam_search: {self.beam_search} \
+                     context_graph_score: {kwargs.get("context_graph_score", 0.0)} context_list_path: {kwargs.get("context_list_path", None)}')
+        #logging.info(f'tokenizer: {tokenizer}  tokenizer: {kwargs.get("tokenizer", None)} token_list: {kwargs.get("token_list", None)}')
         pred_timestamp = kwargs.get("pred_timestamp", False)
         if self.beam_search is None and (is_use_lm or is_use_ctc):
+            self.context_graph = None 
+            if kwargs.get("context_graph_score", 0.0) > 0.00001 and kwargs.get("context_list_path", None):
+                context_list_path = kwargs.get("context_list_path")
+                context_graph_score = kwargs.get("context_graph_score")
+                token_list = kwargs.get("token_list", None)
+                symbol_table = {}
+                for i, t in enumerate(token_list):
+                    symbol_table[t] = i
+                # hotword
+                self.hotword_list = self.generate_hotwords_list(
+                    context_list_path, tokenizer=tokenizer, frontend=frontend
+                )
+                logging.info(f"hotword_list: {self.hotword_list}")
+                self.context_graph = ContextGraph(self.hotword_list, symbol_table, context_graph_score, tokenizer)
+
             logging.info("enable beam_search")
             self.init_beam_search(**kwargs)
             self.nbest = kwargs.get("nbest", 1)
@@ -602,3 +631,112 @@ class Paraformer(torch.nn.Module):
             kwargs["max_seq_len"] = 512
         models = export_rebuild_model(model=self, **kwargs)
         return models
+    
+    def generate_hotwords_list(self, hotword_list_or_file, tokenizer=None, frontend=None):
+
+        def seg_tokenize(txt, seg_dict):
+            pattern = re.compile(r"^[\u4E00-\u9FA50-9]+$")
+            out_txt = ""
+            for word in txt:
+                word = word.lower()
+                if word in seg_dict:
+                    out_txt += seg_dict[word] + " "
+                else:
+                    if pattern.match(word):
+                        for char in word:
+                            if char in seg_dict:
+                                out_txt += seg_dict[char] + " "
+                            else:
+                                out_txt += "<unk>" + " "
+                    else:
+                        out_txt += "<unk>" + " "
+            return out_txt.strip().split()
+
+        seg_dict = None
+        if frontend.cmvn_file is not None:
+            model_dir = os.path.dirname(frontend.cmvn_file)
+            seg_dict_file = os.path.join(model_dir, "seg_dict")
+            if os.path.exists(seg_dict_file):
+                seg_dict = load_seg_dict(seg_dict_file)
+            else:
+                seg_dict = None
+        # for None
+        if hotword_list_or_file is None:
+            hotword_list = None
+        # for local txt inputs
+        elif os.path.exists(hotword_list_or_file) and hotword_list_or_file.endswith(".txt"):
+            logging.info("Attempting to parse hotwords from local txt...")
+            hotword_list = []
+            hotword_str_list = []
+            with codecs.open(hotword_list_or_file, "r") as fin:
+                for line in fin.readlines():
+                    hw = line.strip()
+                    hw_list = hw.split()
+                    if seg_dict is not None:
+                        hw_list = seg_tokenize(hw_list, seg_dict)
+                    hotword_str_list.append(hw)
+                    hotword_list.append(tokenizer.tokens2ids(hw_list))
+                hotword_list.append([self.sos])
+                hotword_str_list.append("<s>")
+            logging.info(
+                "Initialized hotword list from file: {}, hotword list: {}.".format(
+                    hotword_list_or_file, hotword_str_list
+                )
+            )
+        # for url, download and generate txt
+        elif hotword_list_or_file.startswith("http"):
+            logging.info("Attempting to parse hotwords from url...")
+            work_dir = tempfile.TemporaryDirectory().name
+            if not os.path.exists(work_dir):
+                os.makedirs(work_dir)
+            text_file_path = os.path.join(work_dir, os.path.basename(hotword_list_or_file))
+            local_file = requests.get(hotword_list_or_file)
+            open(text_file_path, "wb").write(local_file.content)
+            hotword_list_or_file = text_file_path
+            hotword_list = []
+            hotword_str_list = []
+            with codecs.open(hotword_list_or_file, "r") as fin:
+                for line in fin.readlines():
+                    hw = line.strip()
+                    hw_list = hw.split()
+                    if seg_dict is not None:
+                        hw_list = seg_tokenize(hw_list, seg_dict)
+                    hotword_str_list.append(hw)
+                    hotword_list.append(tokenizer.tokens2ids(hw_list))
+                hotword_list.append([self.sos])
+                hotword_str_list.append("<s>")
+            logging.info(
+                "Initialized hotword list from file: {}, hotword list: {}.".format(
+                    hotword_list_or_file, hotword_str_list
+                )
+            )
+        # for text str input
+        elif not hotword_list_or_file.endswith(".txt"):
+            logging.info("Attempting to parse hotwords as str...")
+            hotword_list = []
+            hotword_str_list = []
+            for hw in hotword_list_or_file.strip().split():
+                hotword_str_list.append(hw)
+                hw_list = hw.strip().split()
+                if seg_dict is not None:
+                    hw_list = seg_tokenize(hw_list, seg_dict)
+                hotword_list.append(tokenizer.tokens2ids(hw_list))
+            hotword_list.append([self.sos])
+            hotword_str_list.append("<s>")
+            logging.info("Hotword list: {}.".format(hotword_str_list))
+        else:
+            hotword_list = None
+        return hotword_list
+
+@lru_cache(maxsize=1)
+def load_seg_dict(seg_dict_file):
+    seg_dict = {}
+    assert isinstance(seg_dict_file, str)
+    with open(seg_dict_file, "r", encoding="utf8") as f:
+        lines = f.readlines()
+        for line in lines:
+            s = line.strip().split()
+            key = s[0]
+            value = s[1:]
+            seg_dict[key] = " ".join(value)
+    return seg_dict

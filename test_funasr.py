@@ -149,7 +149,8 @@ def strip_punctuation(text: str) -> str:
     punctuation = string.punctuation + "，。！？；：【】（）《》‘’“”…—、"
     return re.sub(f"[{re.escape(punctuation)}]", "", text)
 
-def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_graph_score=10.0, decoding_ctc_weight=0.4, beam_size=5, mode='greedy_search'):
+def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_graph_score=10.0, decoding_ctc_weight=0.4, beam_size=5, mode='greedy_search', 
+               lm_weight=0.0, lm_file=None, pre_beam_score_key=None, pre_beam_ratio=1.5):
     if mode == 'greedy_search':
         logging.info('init greedy_search')
         text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt)[0]['text']
@@ -157,7 +158,8 @@ def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_gra
         logging.info(f"decoding_ctc_weight: {decoding_ctc_weight}, beam_size: {beam_size}") 
         text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt, decoding_ctc_weight=decoding_ctc_weight,
                               beam_size=beam_size, context_list_path=hotword_list_txt,
-                                context_graph_score=context_graph_score)[0]['text']
+                                context_graph_score=context_graph_score, lm_weight=lm_weight, lm_file=lm_file,
+                                pre_beam_score_key=pre_beam_score_key, pre_beam_ratio=pre_beam_ratio)[0]['text']
     
     return text 
 
@@ -215,6 +217,8 @@ def main(args):
                     model, wav_path, args.batch_size,
                     args.hotwords, args.context_graph_score,
                     args.decoding_ctc_weight, args.beam_size, args.mode,
+                    args.lm_weight, args.lm_file, args.pre_beam_score_key,
+                    args.pre_beam_ratio
                 )
                 # 2. 如果是 SenseVoiceSmall，先做特殊标记清理
                 if isinstance(model.model, SenseVoiceSmall):
@@ -247,6 +251,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1, help="批量大小")
     parser.add_argument("--mode", type=str, default='greedy_search', help="搜索模式")
     parser.add_argument("--beam_size", type=int, default=5, help="beam 大小")
+    parser.add_argument("--lm_weight", type=float, default=0.0, help="LM 权重")
+    parser.add_argument("--lm_file", type=str, default=None, help="LM 文件")
+    parser.add_argument("--pre_beam_score_key", type=str, default=None, help="pre beam score key")
+    parser.add_argument("--pre_beam_ratio", type=float, default=1.5, help="pre beam ratio")
     parser.add_argument("--verbose", action="store_true", help="打印逐条结果")
     args = parser.parse_args()
     main(args)
