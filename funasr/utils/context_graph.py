@@ -23,7 +23,8 @@ from funasr.tokenizer.char_tokenizer import CharTokenizer
 
 from typing import Dict, List, Tuple
 from collections import deque
-from typing import Dict, List, Tuple, Optional            # + Optional
+from typing import Dict, List, Tuple, Optional  
+import logging           # + Optional
 try:                                                     # 新增：检测 graphviz
     import graphviz
     _GRAPHVIZ_AVAILABLE = True
@@ -143,6 +144,8 @@ class ContextGraph:
         self.context_score = context_score
         self.context_list = hotword_list #tokenize(context_list_path, symbol_table, bpe_model, tokenizer)
         self.inv_sym_table = {v: k for k, v in symbol_table.items()}
+        self.unk_id = symbol_table.get('<unk>', 0)
+        logging.info(f'context graph unk_id: {self.unk_id}')
         self.num_nodes = 0
         self.root = ContextState(
             id=self.num_nodes,
@@ -236,6 +239,8 @@ class ContextGraph:
         Returns:
           Return a tuple of score and next state.
         """
+        if self.unk_id == token and isinstance(self.tokenizer, SentencepiecesTokenizer):
+            return (0, state)
         node = None
         score = 0
         # token matched
