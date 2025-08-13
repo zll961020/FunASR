@@ -46,6 +46,7 @@ class BeamSearchPara(torch.nn.Module):
         token_list: List[str] = None,
         pre_beam_ratio: float = 1.5,
         pre_beam_score_key: str = None,
+        tokenizer = None,
     ):
         """Initialize beam search.
 
@@ -96,6 +97,7 @@ class BeamSearchPara(torch.nn.Module):
         self.pre_beam_size = int(pre_beam_ratio * beam_size)
         self.beam_size = beam_size
         self.n_vocab = vocab_size
+        self.tokenizer = tokenizer
         if (
             pre_beam_score_key is not None
             and pre_beam_score_key != "full"
@@ -194,6 +196,8 @@ class BeamSearchPara(torch.nn.Module):
         states = dict()
         for k, d in self.part_scorers.items():
             scores[k], states[k] = d.score_partial(hyp.yseq, ids, hyp.states[k], x)
+            # if torch.sum(scores[k]) > 0:
+            #     logging.info(f'part score: {scores[k]} for k: {k} ')
         return scores, states
 
     def beam(
@@ -308,6 +312,7 @@ class BeamSearchPara(torch.nn.Module):
                     else scores[self.pre_beam_score_key]
                 )
                 part_ids = torch.topk(pre_beam_scores, self.pre_beam_size)[1]
+            #logging.info(f'full score len: {len(self.full_scorers)} hyp: {hyp.yseq} hyp_text: {self.tokenizer.decode(hyp.yseq.tolist())} part ids: {part_ids} decode text: {self.tokenizer.decode(part_ids.tolist())}')
             part_scores, part_states = self.score_partial(hyp, part_ids, x)
             for k in self.part_scorers:
                 weighted_scores[part_ids] += self.weights[k] * part_scores[k]
@@ -450,16 +455,28 @@ class BeamSearchPara(torch.nn.Module):
                     if k == "ctc" and hasattr(d, "context_graph") and d.context_graph is not None:
                         ctx_state = hyp.states[k][2]  # get context_graph state
                         bonus, final_state = d.context_graph.finalize(ctx_state)
+                        if bonus > 0:
+                            logging.info(f'bonus: {bonus} context_graph_state: {ctx_state}')
                         # update scores and states 
                         s = d.final_score(hyp.states[k])
-                        new_scores[k] = hyp.scores[k] + s * self.weights[k] + bonus
+                        new_scores[k] = hyp.scores[k] + s + bonus
                         new_states[k] = (hyp.states[k][0], hyp.states[k][1], final_state)
                         hyp = hyp._replace(score=hyp.score + self.weights[k] * s + bonus,
                                           scores=new_scores, states=new_states)
+                    elif k == "ctx":
+                        bonus, final_state = d.context_graph.finalize(hyp.states[k])
+                        if bonus > 0:
+                            logging.info(f'bonus: {bonus} ctx_state: {hyp.states[k]}')
+                        new_scores[k] = hyp.scores[k] + bonus
+                        new_states[k] = final_state
+                        hyp = hyp._replace(score=hyp.score + self.weights[k] * bonus,
+                                          scores=new_scores, states=new_states)
+
                     else:
                         s = d.final_score(hyp.states[k])
                         hyp.scores[k] += s
                         hyp = hyp._replace(score=hyp.score + self.weights[k] * s)
+                logging.info(f'ended hyp: {hyp.yseq} score: {hyp.score}')
                 ended_hyps.append(hyp)
             else:
                 remained_hyps.append(hyp)
