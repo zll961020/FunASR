@@ -900,7 +900,10 @@ class Trainer:
             torch.distributed.destroy_process_group()
 
     def warp_model(self, model, **kwargs):
-
+        import torch
+        for m in model.modules():
+            if isinstance(m, torch.nn.LSTM):
+                m.flatten_parameters = lambda *args, **kw: None
         if self.use_deepspeed:
             from deepspeed.runtime.zero.stage_1_and_2 import (
                 estimate_zero2_model_states_mem_needs_all_live,

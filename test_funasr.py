@@ -7,7 +7,7 @@ logging.basicConfig(
     force=True  # 强制重新配置，覆盖后续的配置
 )
 from funasr.models.seaco_paraformer.model import SeacoParaformer
-from funasr.models.sense_voice.model import SenseVoiceSmall
+from funasr.models.sense_voice.model import SenseVoiceSmall, SenseVoiceSmallCPNN
 from funasr import AutoModel 
 import json 
 import re, string
@@ -150,10 +150,10 @@ def strip_punctuation(text: str) -> str:
     return re.sub(f"[{re.escape(punctuation)}]", "", text)
 
 def transcribe(model, audio_path, batch_size, hotword_list_txt=None, context_graph_score=10.0, decoding_ctc_weight=0.4, beam_size=5, mode='greedy_search', 
-               lm_weight=0.0, lm_file=None, pre_beam_score_key=None, pre_beam_ratio=1.5):
+               lm_weight=0.0, lm_file=None, pre_beam_score_key=None, pre_beam_ratio=1.5, deep_biasing_score=1.0):
     if mode == 'greedy_search':
         logging.info('init greedy_search')
-        text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt)[0]['text']
+        text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt, context_list_path=hotword_list_txt, deep_biasing_score=deep_biasing_score)[0]['text']
     elif mode == 'beam_search':
         logging.info(f"decoding_ctc_weight: {decoding_ctc_weight}, beam_size: {beam_size}") 
         text = model.generate(audio_path, batch_size=batch_size, hotword=hotword_list_txt, decoding_ctc_weight=decoding_ctc_weight,
@@ -193,6 +193,19 @@ def main(args):
     file_mode = "a" if processed_keys else "w"
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
+    ## 初始化homophonereplacer
+    if args.replace_fst:
+        from sherpa_onnx import HomophoneReplacer, HomophoneReplacerConfig
+
+        cfg = HomophoneReplacerConfig(
+            dict_dir="hr_resources/dict",   # 没有分词需求可设成 ""
+            lexicon="hr_resources/lexicon.txt",   # 必填
+            rule_fsts=args.replace_fst,                         # 若有规则 FST，填路径
+            debug=True                            # 打开日志，观察处理过程
+        )
+
+        hr = HomophoneReplacer(cfg)
+
     # 打开文件
     with open(args.input, "r", encoding="utf-8") as fin, \
          open(args.output, file_mode, encoding="utf-8") as fout:
@@ -218,13 +231,17 @@ def main(args):
                     args.hotwords, args.context_graph_score,
                     args.decoding_ctc_weight, args.beam_size, args.mode,
                     args.lm_weight, args.lm_file, args.pre_beam_score_key,
-                    args.pre_beam_ratio
+                    args.pre_beam_ratio,
+                    args.deep_biasing_score, 
                 )
                 # 2. 如果是 SenseVoiceSmall，先做特殊标记清理
-                if isinstance(model.model, SenseVoiceSmall):
+                if isinstance(model.model, SenseVoiceSmall) or isinstance(model.model, SenseVoiceSmallCPNN):
                     text_raw = format_str_v3(text_raw)
                 # 3. 最后再去掉标点
                 text = strip_punctuation(text_raw)
+                text = text.replace(" ", "")
+                if args.replace_fst:
+                    text = hr.apply(text)
 
                 fout.write(f"{key} {text}\n")
                 ok += 1
@@ -256,5 +273,8 @@ if __name__ == "__main__":
     parser.add_argument("--pre_beam_score_key", type=str, default=None, help="pre beam score key")
     parser.add_argument("--pre_beam_ratio", type=float, default=1.5, help="pre beam ratio")
     parser.add_argument("--verbose", action="store_true", help="打印逐条结果")
+    parser.add_argument("--replace_fst", type=str, default=None, help="替换 fst 文件")
+    parser.add_argument("--deep_biasing_score", type=float, default=1.0, help="deep biasing 得分")
+
     args = parser.parse_args()
     main(args)

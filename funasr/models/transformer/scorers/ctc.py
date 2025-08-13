@@ -10,18 +10,19 @@ from funasr.models.transformer.scorers.scorer_interface import BatchPartialScore
 class CTCPrefixScorer(BatchPartialScorerInterface):
     """Decoder interface wrapper for CTCPrefixScore."""
 
-    def __init__(self, ctc: torch.nn.Module, eos: int):
+    def __init__(self, ctc: torch.nn.Module, eos: int, context_graph: None):
         """Initialize class.
 
         Args:
             ctc (torch.nn.Module): The CTC implementation.
                 For example, :class:`espnet.nets.pytorch_backend.ctc.CTC`
             eos (int): The end-of-sequence id.
-
+            context_graph (None): The context graph.
         """
         self.ctc = ctc
         self.eos = eos
         self.impl = None
+        self.context_graph = context_graph
 
     def init_state(self, x: torch.Tensor):
         """Get an initial state for decoding.
@@ -35,7 +36,11 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
         logp = self.ctc.log_softmax(x.unsqueeze(0)).detach().squeeze(0).cpu().numpy()
         # TODO(karita): use CTCPrefixScoreTH
         self.impl = CTCPrefixScore(logp, 0, self.eos, np)
-        return 0, self.impl.initial_state()
+        if self.context_graph:
+            ctx_state = self.context_graph.root 
+            return 0, self.impl.initial_state(), ctx_state
+        else:
+            return 0, self.impl.initial_state()
 
     def select_state(self, state, i, new_id=None):
         """Select state with relative ids in the main beam search.
@@ -53,6 +58,9 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
             if len(state) == 2:  # for CTCPrefixScore
                 sc, st = state
                 return sc[i], st[i]
+            elif len(state) == 3:
+                sc, st, ctx_state = state
+                return sc[i], st[i], ctx_state[i]
             else:  # for CTCPrefixScoreTH (need new_id > 0)
                 r, log_psi, f_min, f_max, scoring_idmap = state
                 s = log_psi[i, new_id].expand(log_psi.size(1))
@@ -77,10 +85,27 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
                 and next state for ys
 
         """
-        prev_score, state = state
+        if self.context_graph:
+            prev_score, state, ctx_state = state
+        else:
+            prev_score, state = state
         presub_score, new_st = self.impl(y.cpu(), ids.cpu(), state)
         tscore = torch.as_tensor(presub_score - prev_score, device=x.device, dtype=x.dtype)
-        return tscore, (presub_score, new_st)
+        if self.context_graph is not None:
+            ctx_scores = []
+            new_ctx_states = [] 
+            for i, token_id in enumerate(ids):
+                ctx_score, new_ctx_state = self.context_graph.forward_one_step(ctx_state, token_id.item())
+                ctx_scores.append(ctx_score)
+                new_ctx_states.append(new_ctx_state)
+            # 合并分数
+            ctx_scores = torch.tensor(ctx_scores, device=x.device, dtype=x.dtype)
+            tscore += ctx_scores
+            return tscore, (presub_score, new_st, new_ctx_states)
+        else:
+            return tscore, (presub_score, new_st)
+
+       
 
     def batch_init_state(self, x: torch.Tensor):
         """Get an initial state for decoding.
