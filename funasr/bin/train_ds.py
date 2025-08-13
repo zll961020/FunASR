@@ -93,6 +93,8 @@ def main(**kwargs):
     device = kwargs.get("device", "cuda")
     kwargs["device"] = "cpu"
     model = AutoModel(**kwargs)
+    token_list = model.kwargs.get("token_list", None)
+    logging.info(f'token_list len: {len(token_list)}')
 
     # save config.yaml
     if rank == 0:
@@ -143,6 +145,9 @@ def main(**kwargs):
 
     # dataset
     logging.info("Build dataloader")
+    # funasr/bin/train_ds.py 中，在构建 dataloader 之前
+    if "token_list" in kwargs and kwargs["token_list"] is not None:
+        kwargs["dataset_conf"]["token_list"] = kwargs["token_list"]
     dataloader_class = tables.dataloader_classes.get(
         kwargs["dataset_conf"].get("dataloader", "DataloaderMapStyle")
     )
