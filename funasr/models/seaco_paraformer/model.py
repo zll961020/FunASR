@@ -374,6 +374,8 @@ class SeacoParaformer(BiCifParaformer, Paraformer):
         is_use_lm = (
             kwargs.get("lm_weight", 0.0) > 0.00001 and kwargs.get("lm_file", None) is not None
         )
+        logging.info(f"is_use_ctc: {is_use_ctc}, is_use_lm: {is_use_lm} , beam_search: {self.beam_search}") 
+        logging.info(f"decoding_ctc_weight: {kwargs.get('decoding_ctc_weight')}, ctc: {self.ctc}")
         if self.beam_search is None and (is_use_lm or is_use_ctc):
             logging.info("enable beam_search")
             self.init_beam_search(**kwargs)
@@ -403,7 +405,7 @@ class SeacoParaformer(BiCifParaformer, Paraformer):
         self.hotword_list = self.generate_hotwords_list(
             kwargs.get("hotword", None), tokenizer=tokenizer, frontend=frontend
         )
-
+        logging.info(f"hotword_list: {self.hotword_list}")
         # Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
         if isinstance(encoder_out, tuple):
